@@ -6,8 +6,8 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
-from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from db import connect, now_iso, ticket_release_state, write_audit
+from locks import release_pier_lock, require_pier_lock
 from models import TicketIn
 from validators import (
     adjudicate_overload,
@@ -48,6 +48,7 @@ def list_tickets(authorization: AuthHeader = None, status: str | None = None):
         for r in rows:
             d = dict(r)
             d["axle_weights"] = json.loads(d["axle_weights"] or "[]")
+            d.update(ticket_release_state(conn, d["id"]))
             items.append(d)
         return {"items": items}
 
@@ -81,7 +82,7 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
             (ticket_id,),
         ).fetchall()
         return {
-            "ticket": data,
+            "ticket": {**data, **ticket_release_state(conn, ticket_id)},
             "overload_holds": [dict(h) for h in holds],
             "gate_seals": [dict(s) for s in seals],
             "gate_releases": [dict(r) for r in releases],
@@ -92,9 +93,9 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
 def create_ticket(body: TicketIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
     lock_key = f"lane:{body.lane_id}"
-    with connect() as conn:
-        require_lock(conn, lock_key, user)
-        try:
+    require_pier_lock(lock_key, user)
+    try:
+        with connect() as conn:
             lane = conn.execute(
                 """SELECT l.*, b.max_gross_t, b.axle_limit FROM weigh_lanes l
                    JOIN weigh_bridges b ON b.id=l.bridge_id WHERE l.id=?""",
@@ -178,5 +179,5 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
                 "status": status,
                 "overload": is_over,
             }
-        finally:
-            release(conn, lock_key, user)
+    finally:
+        release_pier_lock(lock_key, user)

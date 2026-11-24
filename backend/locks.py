@@ -1,4 +1,4 @@
-"""码头锁与争用登记（写入路径嵌入）。"""
+"""码头锁与争用登记（独立短连接，锁事务不与业务事务互锁）。"""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
@@ -16,6 +16,7 @@ class LockIn(BaseModel):
 
 
 def try_acquire(conn, lock_key: str, holder: str) -> bool:
+    """兼容旧签名：在给定连接上试探（仅锁管理端点使用）。"""
     now = now_iso()
     row = conn.execute(
         "SELECT holder FROM pier_locks WHERE lock_key=?", (lock_key,)
@@ -36,6 +37,44 @@ def try_acquire(conn, lock_key: str, holder: str) -> bool:
     return False
 
 
+def acquire_pier_lock(lock_key: str, holder: str) -> bool:
+    """独立短连接抢码头锁并立即提交，避免长事务占住 SQLite 写位。"""
+    with connect() as conn:
+        now = now_iso()
+        row = conn.execute(
+            "SELECT holder FROM pier_locks WHERE lock_key=?", (lock_key,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO pier_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
+                (lock_key, holder, now),
+            )
+            conn.commit()
+            return True
+        if row["holder"] == holder:
+            return True
+        # 争用痕独立事务提交：败方随后抛 409，痕迹不随业务回滚蒸发
+        conn.execute(
+            """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+               VALUES (?,?,?,?,?)""",
+            (lock_key, holder, "争用", f"持有者={row['holder']}", now),
+        )
+        write_audit(
+            conn,
+            holder,
+            "lock_contention",
+            lock_key,
+            {"holder": row["holder"]},
+        )
+        conn.commit()
+        return False
+
+
+def ticket_gate_lock_key(ticket_id: int) -> str:
+    """同票写操作统一闸口锁键：放行/超重/封闸共用，消除跨域竞态窗口。"""
+    return f"gate:{ticket_id}"
+
+
 def release(conn, lock_key: str, holder: str) -> None:
     conn.execute(
         "DELETE FROM pier_locks WHERE lock_key=? AND holder=?",
@@ -43,8 +82,20 @@ def release(conn, lock_key: str, holder: str) -> None:
     )
 
 
+def release_pier_lock(lock_key: str, holder: str) -> None:
+    with connect() as conn:
+        release(conn, lock_key, holder)
+        conn.commit()
+
+
 def require_lock(conn, lock_key: str, holder: str) -> None:
     if not try_acquire(conn, lock_key, holder):
+        raise HTTPException(409, "争用：后到只记争用，不写业务")
+
+
+def require_pier_lock(lock_key: str, holder: str) -> None:
+    """抢码头锁：失败即 409，争用痕已独立落库。"""
+    if not acquire_pier_lock(lock_key, holder):
         raise HTTPException(409, "争用：后到只记争用，不写业务")
 
 

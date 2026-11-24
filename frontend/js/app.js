@@ -31,6 +31,7 @@ createApp({
     const tickets = ref([]);
     const overloads = ref([]);
     const gateReleases = ref([]);
+    const releaseFates = ref([]);
     const seals = ref([]);
     const blList = ref([]);
     const lineageEdges = ref([]);
@@ -79,12 +80,20 @@ createApp({
     const adjudicableTickets = computed(() =>
       tickets.value.filter((t) => t.status !== "作废" && t.status !== "已封闸")
     );
+    // 放行候选：已裁定且无开放超重禁放（禁放票不得出现在放行口）
     const releasableTickets = computed(() =>
-      tickets.value.filter((t) => t.status === "已裁定")
+      tickets.value.filter((t) => t.status === "已裁定" && !t.release_blocked)
     );
     const sealableTickets = computed(() =>
       tickets.value.filter((t) => ["已裁定","已放行"].includes(t.status))
     );
+    function isReleaseBlocked(t) {
+      return !!(t && t.release_blocked);
+    }
+    function blockReasonText(t) {
+      if (!isReleaseBlocked(t)) return "";
+      return t.block_reason_code === "OPEN_OVERLOAD" ? "开放超重禁放" : "禁放";
+    }
 
     function fmtT(n) {
       if (n == null || n === "") return "—";
@@ -126,9 +135,9 @@ createApp({
       if (!token.value) return;
       clearFlash();
       try {
-        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2] = await Promise.all([
+        const [d, br, ln, tk, ov, gr, gf, sl, bl, lg, cj, cj2] = await Promise.all([
           api.dashboard(), api.bridges(), api.lanes(), api.tickets(), api.overloads(),
-          api.gateReleases(), api.seals(), api.blList(), api.lineage(),
+          api.gateReleases(), api.releaseFate(), api.seals(), api.blList(), api.lineage(),
           api.customsJobs(), api.craneJobs(),
         ]);
         dash.value = d || {};
@@ -137,6 +146,7 @@ createApp({
         tickets.value = tk.items || [];
         overloads.value = ov.items || [];
         gateReleases.value = gr.items || [];
+        releaseFates.value = gf.items || [];
         seals.value = sl.items || [];
         blList.value = bl.items || [];
         lineageEdges.value = lg.items || [];
@@ -261,12 +271,13 @@ createApp({
 
     return {
       token, user, username, password, err, actionErr, actionOk, tab, nav,
-      dash, bridges, lanes, tickets, overloads, gateReleases, seals, blList,
+      dash, bridges, lanes, tickets, overloads, gateReleases, releaseFates, seals, blList,
       lineageEdges, customsJobs, craneJobs, bridgeDetail, ticketDetail,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       bridgeForm, laneForm, ticketForm, overloadOpenForm, gateForm, sealForm,
       blForm, lineageForm, customsForm, craneForm,
       adjudicableTickets, releasableTickets, sealableTickets,
+      isReleaseBlocked, blockReasonText,
       login, logout, refresh,
       fmtT, ticketClass, shortText,
       createBridge, loadBridgeDetail, createLane, createTicket, loadTicketDetail, selectTicket,
@@ -294,6 +305,7 @@ createApp({
           </div>
           <div class="stat-strip">
             <span class="stat-pill">超重<strong>{{ dash.open_overloads ?? 0 }}</strong></span>
+            <span class="stat-pill">禁放<strong :style="(dash.release_blocked ?? 0) ? 'color:var(--bad)' : ''">{{ dash.release_blocked ?? 0 }}</strong></span>
             <span class="stat-pill">旁路<strong>{{ dash.side_pending ?? 0 }}</strong></span>
             <span class="stat-pill">在港票<strong>{{ dash.tickets ?? 0 }}</strong></span>
           </div>

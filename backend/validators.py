@@ -3,6 +3,18 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
+from db import BLOCK_REASON_OPEN_OVERLOAD, now_iso
+
+
+def open_overload_hold(conn, ticket_id: int):
+    """返回该票仍开放的超重挂起；无则 None。"""
+    return conn.execute(
+        """SELECT h.* FROM overload_holds h
+           WHERE h.ticket_id=? AND h.status='开放'
+           ORDER BY h.id DESC LIMIT 1""",
+        (ticket_id,),
+    ).fetchone()
+
 
 def validate_lane_open(lane: dict) -> None:
     if lane["status"] not in ("开放", "维护"):
@@ -59,14 +71,33 @@ def validate_ticket_sealable(ticket: dict) -> None:
         raise HTTPException(409, "票态已锁定")
 
 
-def validate_no_open_overload(conn, ticket_id: int) -> None:
-    row = conn.execute(
-        """SELECT id FROM overload_holds
-           WHERE ticket_id=? AND status='开放' LIMIT 1""",
-        (ticket_id,),
-    ).fetchone()
-    if row:
-        raise HTTPException(409, "存在开放超重挂起，不得放行")
+def record_release_fate(
+    conn,
+    ticket_id: int,
+    ticket_code: str,
+    officer: str,
+    verdict: str,
+    reason_code: str,
+    detail: str,
+    formal_written: bool = False,
+) -> int:
+    """追加一条放行命运条。只允许 INSERT：禁放条当日封存，不提供改/删/晋升。"""
+    cur = conn.execute(
+        """INSERT INTO gate_release_fate(ticket_id,ticket_code,officer,verdict,
+           reason_code,detail,formal_written,sealed_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            ticket_id,
+            ticket_code,
+            officer,
+            verdict,
+            reason_code,
+            detail,
+            1 if formal_written else 0,
+            now_iso(),
+        ),
+    )
+    return cur.lastrowid
 
 
 def format_manifest(ticket: dict, gross: float, generation: int) -> str:

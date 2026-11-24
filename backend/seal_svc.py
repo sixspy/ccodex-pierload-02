@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from locks import release_pier_lock, require_pier_lock, ticket_gate_lock_key
 from models import SealIn
 from validators import format_manifest, validate_ticket_sealable
 
@@ -28,10 +28,10 @@ def list_seals(authorization: AuthHeader = None):
 @router.post("/api/seals")
 def create_seal(body: SealIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
-    lock_key = f"ticket:{body.ticket_id}"
-    with connect() as conn:
-        require_lock(conn, lock_key, user)
-        try:
+    lock_key = ticket_gate_lock_key(body.ticket_id)
+    require_pier_lock(lock_key, user)
+    try:
+        with connect() as conn:
             ticket = conn.execute(
                 "SELECT * FROM weigh_tickets WHERE id=?", (body.ticket_id,)
             ).fetchone()
@@ -80,8 +80,8 @@ def create_seal(body: SealIn, authorization: AuthHeader = None):
                 "manifest": manifest,
                 "status": "已封闸",
             }
-        finally:
-            release(conn, lock_key, user)
+    finally:
+        release_pier_lock(lock_key, user)
 
 
 @router.get("/api/seals/{seal_ref}")

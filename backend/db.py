@@ -36,6 +36,8 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # WAL 为库级持久模式（init_db 已切），这里只给当前连接设忙等
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -115,6 +117,18 @@ CREATE TABLE IF NOT EXISTS gate_releases(
   FOREIGN KEY(ticket_id) REFERENCES weigh_tickets(id),
   FOREIGN KEY(lane_id) REFERENCES weigh_lanes(id)
 );
+CREATE TABLE IF NOT EXISTS gate_release_fate(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id INTEGER NOT NULL,
+  ticket_code TEXT NOT NULL,
+  officer TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  detail TEXT,
+  formal_written INTEGER NOT NULL DEFAULT 0,
+  sealed_at TEXT NOT NULL,
+  FOREIGN KEY(ticket_id) REFERENCES weigh_tickets(id)
+);
 CREATE TABLE IF NOT EXISTS gate_seals(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ticket_id INTEGER NOT NULL,
@@ -193,6 +207,31 @@ def write_audit(
            VALUES (?,?,?,?,?)""",
         (actor, action, target, json.dumps(payload, ensure_ascii=False), now_iso()),
     )
+
+
+# 开放超重禁放行：票级禁放口径（五页同态的唯一事实源）
+BLOCK_REASON_OPEN_OVERLOAD = "OPEN_OVERLOAD"
+
+
+def ticket_release_state(conn: sqlite3.Connection, ticket_id: int) -> dict:
+    """计算单票放行态：已放行 / 开放超重禁放 / 可放行。"""
+    released = conn.execute(
+        """SELECT id FROM gate_releases
+           WHERE ticket_id=? AND status='已放行' LIMIT 1""",
+        (ticket_id,),
+    ).fetchone()
+    open_hold = conn.execute(
+        """SELECT hold_key FROM overload_holds
+           WHERE ticket_id=? AND status='开放' ORDER BY id DESC LIMIT 1""",
+        (ticket_id,),
+    ).fetchone()
+    blocked = open_hold is not None
+    return {
+        "released": released is not None,
+        "release_blocked": blocked,
+        "block_reason_code": BLOCK_REASON_OPEN_OVERLOAD if blocked else None,
+        "open_hold_key": open_hold["hold_key"] if open_hold else None,
+    }
 
 
 def _load_json(name: str):
@@ -438,6 +477,8 @@ def seed_lineage_samples(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     with connect() as conn:
+        # WAL 只切一次：库级持久属性，避免多连接并发切日志模式撞锁
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         seed_users(conn)
         seed_bridges(conn)
@@ -477,6 +518,10 @@ def dashboard_stats(conn: sqlite3.Connection) -> dict:
         """SELECT COUNT(*) c FROM weigh_tickets
            WHERE status='旁路挂起'"""
     ).fetchone()["c"]
+    blocked = conn.execute(
+        """SELECT COUNT(DISTINCT h.ticket_id) c FROM overload_holds h
+           WHERE h.status='开放'"""
+    ).fetchone()["c"]
     return {
         "bridges": bridges,
         "lanes": lanes,
@@ -486,6 +531,7 @@ def dashboard_stats(conn: sqlite3.Connection) -> dict:
         "gate_seals": sealed,
         "bl_manifests": bl_count,
         "side_pending": pending,
+        "release_blocked": blocked,
         "stubs": stubs,
         "meta": PRODUCT_META,
     }
